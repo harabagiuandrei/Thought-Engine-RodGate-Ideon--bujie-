@@ -1,0 +1,30 @@
+class ThoughtEvent:
+    def __init__(self, ops, d_mdl, d_free_energy, stability, psi_score, accepted):
+        self.ops = ops                  # e.g. ["Merge(A,B→C)", "Weave(C↔T)"]
+        self.d_mdl = d_mdl              # L_old - L_new  (compression gain)
+        self.d_free_energy = d_free_energy
+        self.stability = stability      # 0..1
+        self.psi_score = psi_score      # -1..+1
+        self.accepted = accepted
+
+class ConstraintField:
+    def penalty(self, manifold, event): ...
+    def bonus(self, manifold, event): ...
+
+class IdeonNeuron:
+    def __init__(self, constraints, thresholds):
+        self.constraints = constraints  # list[ConstraintField]
+        self.th = thresholds            # dict: {"mdl":.., "fe":.., "stab":.., "psi":..}
+
+    def tick(self, manifold, sensory):
+        RodGate.route(manifold, sensory)                    # (1)
+        candidates = self._propose_candidates(manifold)     # (2)
+        scored = [self._score(manifold, c) for c in candidates]  # (3)
+        stable = [self._stability(manifold, s) for s in scored]  # (4)
+        audited = [self._apply_constraints(manifold, s) for s in stable]  # (5)
+        best = self._select(audited)
+        if self._passes(best):                               # (6)
+            manifold = self._commit(manifold, best)
+            self._plasticity(manifold, best)                 # (7)
+        self._emit_memory(manifold, best)                    # (8)
+        return manifold, best

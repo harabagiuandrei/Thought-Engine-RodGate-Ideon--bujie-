@@ -1,0 +1,285 @@
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Any, Optional
+import math
+import random
+
+# Depends on the two previous files placed alongside:
+#  - ideon_thought_engine.py
+#  - vnn_cortex.py
+try:
+    from ideon_thought_engine import (
+        Manifold, RodGate, CFS, Scorer, default_psi,
+        ConstraintField, EmbodimentPrior, CausalityPrior, ValuePrior, LanguagePrior,
+        SafetyPrior, SimplicityPrior, ResourcePrior, ConsistencyPrior,
+        PlasticityRegulator, ThoughtMemory, ThoughtEvent, Candidate
+    )
+except Exception as e:
+    raise RuntimeError("Please ensure 'ideon_thought_engine.py' is available.")
+
+# ------------------------------
+# Role definitions
+# ------------------------------
+
+@dataclass
+class RoleProfile:
+    name: str
+    proposal_width: int
+    thresholds: Dict[str, float]
+    weights: Dict[str, float]
+    prior_weights: Dict[str, float]  # scale per prior name
+
+
+def base_priors() -> Dict[str, ConstraintField]:
+    return {
+        'EmbodimentPrior': EmbodimentPrior(),
+        'CausalityPrior': CausalityPrior(),
+        'ValuePrior': ValuePrior(),
+        'LanguagePrior': LanguagePrior(),
+        'SafetyPrior': SafetyPrior(),
+        'SimplicityPrior': SimplicityPrior(),
+        'ResourcePrior': ResourcePrior(),
+        'ConsistencyPrior': ConsistencyPrior(),
+    }
+
+
+# Default roles (can be extended at runtime)
+DEFAULT_ROLES: Dict[str, RoleProfile] = {
+    'compressor': RoleProfile(
+        name='compressor', proposal_width=6,
+        thresholds={'mdl':0.015,'fe':0.005,'stab':0.70,'psi':-0.25,'disc':0.50},
+        weights={'w1':0.50,'w2':0.20,'w3':0.20,'w4':0.10,'w5':0.25},
+        prior_weights={
+            'EmbodimentPrior':1.0,'CausalityPrior':1.0,'ValuePrior':1.0,
+            'LanguagePrior':1.2,'SafetyPrior':1.0,'SimplicityPrior':1.2,
+            'ResourcePrior':1.0,'ConsistencyPrior':1.0
+        }
+    ),
+    'planner': RoleProfile(
+        name='planner', proposal_width=7,
+        thresholds={'mdl':0.010,'fe':0.006,'stab':0.75,'psi':-0.15,'disc':0.50},
+        weights={'w1':0.35,'w2':0.30,'w3':0.20,'w4':0.15,'w5':0.28},
+        prior_weights={
+            'EmbodimentPrior':1.1,'CausalityPrior':1.3,'ValuePrior':1.0,
+            'LanguagePrior':1.0,'SafetyPrior':1.0,'SimplicityPrior':1.0,
+            'ResourcePrior':1.0,'ConsistencyPrior':1.1
+        }
+    ),
+    'safety': RoleProfile(
+        name='safety', proposal_width=4,
+        thresholds={'mdl':0.020,'fe':0.010,'stab':0.82,'psi':0.00,'disc':0.60},
+        weights={'w1':0.35,'w2':0.25,'w3':0.25,'w4':0.15,'w5':0.40},
+        prior_weights={
+            'EmbodimentPrior':1.2,'CausalityPrior':1.2,'ValuePrior':1.2,
+            'LanguagePrior':0.9,'SafetyPrior':1.6,'SimplicityPrior':1.0,
+            'ResourcePrior':1.2,'ConsistencyPrior':1.3
+        }
+    ),
+    'curiosity': RoleProfile(
+        name='curiosity', proposal_width=8,
+        thresholds={'mdl':0.000,'fe':-0.005,'stab':0.60,'psi':-0.50,'disc':0.45},
+        weights={'w1':0.25,'w2':0.20,'w3':0.15,'w4':0.20,'w5':0.20},
+        prior_weights={
+            'EmbodimentPrior':0.9,'CausalityPrior':0.9,'ValuePrior':1.0,
+            'LanguagePrior':1.0,'SafetyPrior':0.8,'SimplicityPrior':0.9,
+            'ResourcePrior':0.8,'ConsistencyPrior':0.9
+        }
+    ),
+}
+
+
+# ------------------------------
+# Polymorph Ideon Agent
+# ------------------------------
+
+class PolymorphIdeon:
+    """A single neuron that can be *any other neuron* by blending role profiles.
+    Role selection is soft (mixture) and adapts from telemetry.
+    """
+    def __init__(self, name: str, rodgate: RodGate, psi_fn, roles: Dict[str, RoleProfile] = None, seed: int = 1234):
+        self.name = name
+        self.rg = rodgate
+        self.rng = random.Random(seed)
+        self.roles = roles or DEFAULT_ROLES
+        self.role_keys = list(self.roles.keys())
+        self.role_logits = {k: 0.0 for k in self.role_keys}  # unnormalized preferences
+        self.priors = base_priors()  # shared constraint operators
+        self.memory = ThoughtMemory()
+        self.plasticity = PlasticityRegulator()
+        self.cfs_cache: Dict[int, CFS] = {}
+        self.psi_fn = psi_fn
+        self.scores_window: List[float] = []
+        self.reject_window: List[bool] = []
+
+    # ---- role mechanics ----
+    def role_probs(self) -> Dict[str, float]:
+        xs = [self.role_logits[k] for k in self.role_keys]
+        # softmax
+        m = max(xs) if xs else 0.0
+        exps = [math.exp(x - m) for x in xs]
+        Z = sum(exps) or 1.0
+        return {k: exps[i] / Z for i, k in enumerate(self.role_keys)}
+
+    def blended_profile(self) -> RoleProfile:
+        p = self.role_probs()
+        # Blend integers by expectation and round sensibly
+        def bnum(key: str, round_to: int = None):
+            val = sum(p[r] * getattr(self.roles[r], key) for r in self.role_keys if key == 'proposal_width')
+            return max(1, int(round(val)))
+        # Blend dicts by weighted average
+        def bdict(attr: str):
+            keys = set().union(*[getattr(self.roles[r], attr).keys() for r in self.role_keys])
+            out = {}
+            for k in keys:
+                out[k] = sum(p[r] * getattr(self.roles[r], attr).get(k, 0.0) for r in self.role_keys)
+            return out
+        return RoleProfile(
+            name='blend',
+            proposal_width=bnum('proposal_width'),
+            thresholds=bdict('thresholds'),
+            weights=bdict('weights'),
+            prior_weights=bdict('prior_weights'),
+        )
+
+    # ---- propose and score like an Ideon, but with blended params ----
+    def propose_best(self, M: Manifold) -> ThoughtEvent:
+        prof = self.blended_profile()
+        # cache CFS per width for efficiency
+        key = prof.proposal_width
+        if key not in self.cfs_cache:
+            self.cfs_cache[key] = CFS(self.rg, proposal_width=key, seed=self.rng.randint(1, 10**9))
+        cfs = self.cfs_cache[key]
+        scorer = Scorer(self.rg, psi_fn=self.psi_fn)
+
+        cands = cfs.propose(M)
+        if not cands:
+            return ThoughtEvent([], 0,0,1,0,0,0, False, f"{self.name}: no candidates")
+        events = [scorer.score(M, c) for c in cands]
+
+        # Apply blended prior weights
+        for E in events:
+            penalty = 0.0
+            bonus   = 0.0
+            for pname, prior in self.priors.items():
+                w = prof.prior_weights.get(pname, 1.0)
+                penalty += w * prior.penalty(M, E)
+                bonus   += w * prior.bonus(M, E)
+            E.constraint_penalty = max(0.0, penalty - bonus)
+
+        # Discovery score using blended weights
+        def norm(x: float) -> float:
+            return 1.0 / (1.0 + math.exp(-5 * x))
+        for E in events:
+            E.discovery = (
+                prof.weights.get('w1',0.4)*norm(E.d_mdl)
+                + prof.weights.get('w2',0.25)*norm(E.d_free_energy)
+                + prof.weights.get('w3',0.2)*E.stability
+                + prof.weights.get('w4',0.15)*(0.5*(E.psi_score+1.0))
+                - prof.weights.get('w5',0.3)*norm(E.constraint_penalty)
+            )
+
+        best = max(events, key=lambda e: e.discovery)
+        passes = (
+            best.d_mdl > prof.thresholds.get('mdl',0.0)
+            and best.d_free_energy > prof.thresholds.get('fe',0.0)
+            and best.stability > prof.thresholds.get('stab',0.0)
+            and best.psi_score > prof.thresholds.get('psi',-1.0)
+            and best.discovery > prof.thresholds.get('disc',0.5)
+        )
+        best.accepted = passes
+        best.reason = f"{self.name}: {'ready' if passes else 'candidate'}"
+
+        # Track telemetry for meta-adaptation
+        self.scores_window.append(best.discovery)
+        self.reject_window.append(not passes)
+        if len(self.scores_window) > 20:
+            self.scores_window.pop(0)
+            self.reject_window.pop(0)
+        return best
+
+    def post_commit(self, M: Manifold, E: ThoughtEvent):
+        # plasticity + memory
+        self.plasticity.update(M, E)
+        self.memory.append(E)
+        # meta-adapt roles after each tick
+        self._meta_adapt(M, E)
+
+    # ---- meta-learning rules making any neuron any other neuron ----
+    def _meta_adapt(self, M: Manifold, E: ThoughtEvent):
+        # Signals
+        avg_disc = sum(self.scores_window)/max(1,len(self.scores_window))
+        reject_rate = sum(1 for r in self.reject_window if r)/max(1,len(self.reject_window))
+        complexity = 0.6*len(M.nodes) + 0.4*len(M.edges)
+
+        # Heuristics mapping to role-shifts
+        # 1) Stagnation → increase curiosity
+        if avg_disc < 0.55:
+            self.role_logits['curiosity'] += 0.03
+        # 2) Many rejections → increase safety & compressor (cleaner candidates)
+        if reject_rate > 0.5:
+            self.role_logits['safety'] += 0.04
+            self.role_logits['compressor'] += 0.02
+        # 3) High complexity → favor compressor
+        if complexity > 40:
+            self.role_logits['compressor'] += 0.03
+        # 4) Good accepted event with causal edges → favor planner
+        if E.accepted and any('causes' in op for op in E.ops):
+            self.role_logits['planner'] += 0.02
+        # 5) Normalize / damp to avoid divergence
+        # apply small decay to all to keep exploration
+        for k in self.role_logits:
+            self.role_logits[k] *= 0.995
+
+
+# ------------------------------
+# Minimal cortex using a *single* PolymorphIdeon
+# ------------------------------
+
+class PolymorphVNN:
+    def __init__(self, poly: PolymorphIdeon, rodgate_bus: RodGate):
+        self.poly = poly
+        self.bus = rodgate_bus
+        self.log: List[ThoughtEvent] = []
+
+    def step(self, M: Manifold, sensory: Dict[str,Any]) -> ThoughtEvent:
+        self.bus.route(M, sensory)
+        evt = self.poly.propose_best(M)
+        if evt.accepted:
+            from ideon_thought_engine import Committer
+            Committer.apply_ops(M, evt.ops)
+            evt.reason = f"committed via {self.poly.name} (polymorph)"
+        else:
+            evt.reason = f"no commit (polymorph)"
+        self.poly.post_commit(M, evt)
+        self.log.append(evt)
+        return evt
+
+
+# ------------------------------
+# Demo
+# ------------------------------
+
+if __name__ == '__main__':
+    # Build world
+    M = Manifold(); M.add_node('world')
+    bus = RodGate(seed=99)
+
+    # Task-aware psi (optional): we reuse default_psi here for simplicity
+    psi_fn = default_psi
+
+    poly = PolymorphIdeon('poly-1', rodgate=bus, psi_fn=psi_fn, roles=DEFAULT_ROLES)
+    cortex = PolymorphVNN(poly, rodgate_bus=bus)
+
+    # Seed some objects that could become causal chain endpoints
+    M.add_node('obs::start'); M.add_node('obs::goal')
+    for i in range(3):
+        M.add_node(f'node_{i}')
+
+    for t in range(20):
+        sensory = {'tick': t, 'noise': random.random()}
+        evt = cortex.step(M, sensory)
+        print(f"t={t:02d} | accepted={evt.accepted} | disc={evt.discovery:.3f} | ops={evt.ops} | reason={evt.reason}")
+
+    # Show final role mixture
+    probs = poly.role_probs()
+    print("Final role mixture:", {k: round(v, 3) for k, v in probs.items()})
